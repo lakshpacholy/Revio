@@ -153,13 +153,17 @@ def train(
     epochs:     int = 60,
     batch_size: int = 32,
     patience:   int = 15,
-    seed:       int = 42,
+    seeds:      tuple = (42, 1, 7, 123, 2024),
 ):
-    import tensorflow as tf
-    from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
+    """Train with multiple random restarts and keep the one with best val_loss.
 
-    tf.random.set_seed(seed)
-    np.random.seed(seed)
+    With only ~100-400 training samples, a single seed's initial weights can
+    land the model in a basin it never escapes (see CLAUDE.md history). Model
+    selection is done purely on val_loss across seeds — test set is touched
+    only once, after the winning seed is chosen.
+    """
+    import tensorflow as tf
+    from tensorflow.keras.callbacks import EarlyStopping
 
     model_path = Path(model_path)
     model_path.parent.mkdir(parents=True, exist_ok=True)
@@ -169,55 +173,68 @@ def train(
     print(f"Train: {X_train.shape}  Val: {X_val.shape}  Test: {X_test.shape}")
     print(f"Classes: {label_names}\n")
 
-    # ── Model ─────────────────────────────────────────────────────────────
-    model = build_model(input_shape=X_train.shape[1:], n_classes=len(label_names))
-    model.summary()
+    best_val_loss = float("inf")
+    best_model = None
+    best_history = None
+    best_seed = None
 
-    total_params = model.count_params()
+    for seed in seeds:
+        tf.random.set_seed(seed)
+        np.random.seed(seed)
+
+        model = build_model(input_shape=X_train.shape[1:], n_classes=len(label_names))
+
+        callbacks = [
+            EarlyStopping(
+                monitor="val_loss", patience=patience,
+                restore_best_weights=True, verbose=0,
+            ),
+            tf.keras.callbacks.ReduceLROnPlateau(
+                monitor="val_loss", factor=0.5, patience=6,
+                min_lr=1e-6, verbose=0,
+            ),
+        ]
+
+        history = model.fit(
+            X_train, y_train,
+            validation_data=(X_val, y_val),
+            epochs=epochs,
+            batch_size=batch_size,
+            callbacks=callbacks,
+            verbose=0,
+        )
+
+        val_loss, val_acc = model.evaluate(X_val, y_val, verbose=0)
+        print(f"seed={seed:<6} val_loss={val_loss:.4f}  val_acc={val_acc:.4f}")
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_model = model
+            best_history = history
+            best_seed = seed
+
+    print(f"\nBest seed: {best_seed}  (val_loss={best_val_loss:.4f})")
+    best_model.save(str(model_path))
+
+    total_params = best_model.count_params()
     size_kb = total_params * 4 / 1024
-    print(f"\nParam count : {total_params:,}")
-    print(f"Float32 size: {size_kb:.1f} KB  (TFLite int8 will be ~4× smaller)\n")
-
-    # ── Callbacks ─────────────────────────────────────────────────────────
-    callbacks = [
-        EarlyStopping(
-            monitor="val_loss", patience=patience,
-            restore_best_weights=True, verbose=1,
-        ),
-        ModelCheckpoint(
-            filepath=str(model_path),
-            monitor="val_loss", save_best_only=True, verbose=1,
-        ),
-        tf.keras.callbacks.ReduceLROnPlateau(
-            monitor="val_loss", factor=0.5, patience=6,
-            min_lr=1e-6, verbose=1,
-        ),
-    ]
-
-    # ── Training ──────────────────────────────────────────────────────────
-    history = model.fit(
-        X_train, y_train,
-        validation_data=(X_val, y_val),
-        epochs=epochs,
-        batch_size=batch_size,
-        callbacks=callbacks,
-        verbose=1,
-    )
+    print(f"Param count : {total_params:,}")
+    print(f"Float32 size: {size_kb:.1f} KB  (TFLite int8 will be ~4x smaller)\n")
 
     # ── Evaluation ────────────────────────────────────────────────────────
-    _, val_acc  = model.evaluate(X_val,  y_val,  verbose=0)
-    _, test_acc = model.evaluate(X_test, y_test, verbose=0)
-    print(f"\nVal  accuracy : {val_acc:.4f}")
+    _, val_acc  = best_model.evaluate(X_val,  y_val,  verbose=0)
+    _, test_acc = best_model.evaluate(X_test, y_test, verbose=0)
+    print(f"Val  accuracy : {val_acc:.4f}")
     print(f"Test accuracy : {test_acc:.4f}")
 
-    y_pred = model.predict(X_test, verbose=0).argmax(axis=1)
+    y_pred = best_model.predict(X_test, verbose=0).argmax(axis=1)
 
     # ── Plots ─────────────────────────────────────────────────────────────
-    plot_training_curves(history)
+    plot_training_curves(best_history)
     plot_confusion_matrix(y_test, y_pred, label_names)
 
     print(f"\nModel saved -> {model_path}")
-    return model, history, (val_acc, test_acc)
+    return best_model, best_history, (val_acc, test_acc)
 
 
 # ---------------------------------------------------------------------------
